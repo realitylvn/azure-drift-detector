@@ -137,6 +137,63 @@ than rebuilding it.
   alert-after-cooldown, target-missing) plus the normalisation mapping plus the
   worker-indexes-exactly-`drift_check` check that a plain `azd deploy` never does.
 
+### Checkpoint 2 — timer entrypoint + detector Bicep (Tasks 5–7)
+
+- **The entrypoint is a thin shell around the pure function, same shape as Cost
+  Sentinel.** `drift_check` reads six app settings, calls `azure-mgmt-storage`
+  `get_properties` once inside a `try`, then hands two dicts to `evaluate_drift` and
+  acts on the outcome. All the branching logic that's worth testing lives in the pure
+  function; the entrypoint just does I/O and logging.
+
+- **`ResourceNotFoundError` is caught and turned into `actual=None`, not an early
+  return.** That routes a genuinely-deleted reference resource through the same
+  decision path as everything else and comes out as `target_missing` → a
+  `DriftDetectorSetupError:` trace → the setup-error alert. Any *other* Azure error
+  (throttling, transient 5xx, auth blip) logs and returns without alerting — a missed
+  run is harmless, it checks again on the next schedule. This is the "distinct failure
+  state, not drift" requirement from the spec, implemented as one code path rather than
+  two.
+
+- **`_fmt` renders bools as `true`/`false` in the trace**, matching the Azure portal's
+  own wording, so the alert email reads
+  `allowBlobPublicAccess expected false got true` — legible to someone who has never
+  seen the code.
+
+- **Trace-prefix coupling is called out in both files.** `function_app.py` and
+  `infra/resources.bicep` each carry a comment saying the `DriftDetected:` /
+  `DriftDetectorSetupError:` strings must stay in sync with the other file. The
+  scheduled-query alert matches on `startswith "DriftDetected:"` — the trailing colon
+  is deliberate so it can't also match a hypothetical future `DriftDetected…` string
+  (`DriftDetect**ed**` and `DriftDetect**or**SetupError` already diverge before the
+  colon, but matching it makes the boundary explicit).
+
+- **The cross-resource-group role assignment is a Bicep module, not a manual
+  `az role assignment create`.** `main.bicep` is subscription-scoped; it deploys
+  `resources.bicep` into `rg-drift-detector-dev` and, separately,
+  `reference-rbac.bicep` into `resourceGroup('rg-drift-detector-reference-dev')` —
+  a different resource group than the one being created in the same deployment. Bicep
+  resolves the second group by name at deploy time, so it must already exist. That's
+  what makes "deploy the reference template first" a real dependency the tooling
+  enforces, not a checklist item. The Function's `principalId` flows
+  `resources.bicep` output → `main.bicep` → module param.
+
+- **`Reader` role GUID verified, not assumed** — `az role definition list --name
+  Reader --query "[0].name" -o tsv` → `acdd72a7-3385-48ef-bd42-f606fba81ae7`.
+  Hardcoded in `reference-rbac.bicep` with the verification command in a comment.
+
+- **Action Group `groupShortName` is `driftdtct`** — 9 chars, under the hard 12-char
+  limit Azure enforces on that field (Cost Sentinel used `costsentnl` for the same
+  reason).
+
+- **No Budget resource here.** Cost Sentinel owns the subscription's
+  `Microsoft.Consumption/budgets` guardrail; a second one would just be a duplicate.
+  This project's cost story is "nothing here costs anything" (Functions free grant,
+  an empty storage account, capped Log Analytics).
+
+- **All three Bicep files compile clean** (`az bicep build`, zero warnings):
+  `infra/main.bicep`, `infra/resources.bicep`, `infra/reference-rbac.bicep`.
+  17 Python tests still green.
+
 ---
 
 ## CLI command log
@@ -152,8 +209,11 @@ than rebuilding it.
 | `az bicep build --file reference/reference.bicep --outfile function/reference_template.json` | Compiled the reference "intended state" template to the ARM JSON the Function ships and reads. Run once now; CI re-runs it and fails if the committed copy is stale. First run exposed the `var`→expression issue above. |
 | `pip install azure-mgmt-storage==21.2.1` | Downgraded from the auto-picked 25.1.0 after inspecting both models — 21.2.1 has the flattened attributes the code expects (see decision above). |
 | `.venv\Scripts\python -m pytest -q` | 17 tests green at checkpoint 1. Runs with no Azure and no clock because all I/O stays in the (still stub) timer entrypoint. |
+| `az role definition list --name Reader --query "[0].name" -o tsv` | Verified the built-in `Reader` role GUID (`acdd72a7-3385-48ef-bd42-f606fba81ae7`) before hardcoding it into `infra/reference-rbac.bicep`, rather than guessing. |
+| `az bicep build --file infra/resources.bicep --stdout` | Compiled the detector resources template (Function App, storage + `state` container, Log Analytics, App Insights, Y1 plan, Action Group, two scheduled-query alert rules). Clean, zero warnings. |
+| `az bicep build --file infra/main.bicep --stdout` | Compiled the whole subscription-scoped tree including the cross-RG `reference-rbac.bicep` module. Clean. |
 
-*(No `azd` commands and no resource-creating `az` commands yet — checkpoint 1 is all local. `azd provision` / `azd deploy` and the reference-group deployment happen at Task 9, behind an explicit go-ahead gate.)*
+*(Still no `azd` commands and no resource-creating `az` commands — checkpoints 1–2 are all local: code, Bicep, and `az bicep build`. `azd provision` / `azd deploy` and the reference-group deployment happen at Task 9, behind an explicit go-ahead gate.)*
 
 ---
 
@@ -165,17 +225,23 @@ Filled in as each area is actually exercised.
   project is a working argument for why configuration drift from IaC matters and how
   you detect it. `infra/` is Bicep through `azd`; the reference template is compiled
   and version-controlled; CI gates every change on `az bicep build`.
-- **Least-privilege RBAC** *(designed, built at Task 7)* — a single built-in `Reader`
+- **Least-privilege RBAC** *(built at Task 7)* — a single built-in `Reader`
   assignment, cross-resource-group, scoped to exactly the watched resource group. Good
   concrete contrast with Cost Sentinel's Cost Management Reader and a demonstration of
-  scoping a role to a resource group rather than a subscription.
-- **Deployment & dependencies** *(designed)* — the deliberate "reference group first,
-  detector second" order, enforced by a cross-RG role-assignment module rather than a
-  written instruction, is hands-on AZ-104 "automate deployment of resources" /
-  deployment-dependency material.
-- **Monitoring** *(designed, built at Task 6)* — Azure Monitor scheduled query (log)
-  alerts, Action Groups, Application Insights with sampling disabled and a capped Log
-  Analytics ingestion. Two alert rules at different severities.
+  scoping a role to a resource group rather than a subscription. The `guid()` name is
+  derived from `(resourceGroup().id, principalId, roleId)` so the assignment is
+  idempotent across redeploys.
+- **Deployment & dependencies** *(built at Task 7)* — the deliberate "reference group
+  first, detector second" order, enforced by a cross-RG role-assignment module
+  (`scope: resourceGroup(referenceResourceGroupName)` in a subscription-scoped
+  `main.bicep`) rather than a written instruction, is hands-on AZ-104 "automate
+  deployment of resources" / deployment-dependency material. Module output-to-param
+  wiring passes the Function's `principalId` from one module to another.
+- **Monitoring** *(built at Task 6)* — Azure Monitor scheduled query (log) alerts
+  scoped to the App Insights resource (not the workspace — the `traces` vs `AppTraces`
+  table-name distinction), Action Groups with the 12-char short-name limit,
+  Application Insights with sampling disabled and Log Analytics ingestion capped at
+  1 GB/day. Two alert rules at severity 3 (drift) and severity 2 (detector broken).
 - **Security posture** *(designed)* — `allowBlobPublicAccess` is the featured drift
   example: storage-account exposure settings, the same "unauthorised exposure" theme
   the NSG Scanner project picks up one layer down.
