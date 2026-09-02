@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import azure.functions as func
+from azure.core.exceptions import AzureError, ResourceNotFoundError
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.storage import StorageManagementClient
+from azure.storage.blob import BlobServiceClient
 
 WATCHED_PATHS = [
     "sku.name",
@@ -15,6 +19,9 @@ WATCHED_PATHS = [
     "properties.allowBlobPublicAccess",
     "properties.supportsHttpsTrafficOnly",
 ]
+
+STATE_BLOB_NAME = "last-alert.json"
+_REFERENCE_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "reference_template.json")
 
 _MISSING = object()
 
@@ -114,7 +121,8 @@ def build_expected(template_json) -> dict:
 def build_actual(account) -> dict:
     """Shape an azure-mgmt-storage StorageAccount model into the same dict form
     as build_expected. str() the SDK enums so log messages and comparisons see
-    plain strings."""
+    plain strings. NB: the SDK attribute enable_https_traffic_only maps to the
+    ARM property supportsHttpsTrafficOnly."""
     return {
         "sku": {"name": str(account.sku.name)},
         "tags": dict(account.tags or {}),
@@ -126,9 +134,126 @@ def build_actual(account) -> dict:
     }
 
 
+def _load_reference_template():
+    with open(_REFERENCE_TEMPLATE_PATH) as fh:
+        return json.load(fh)
+
+
+def _get_storage_account(credential, subscription_id, resource_group, account_name):
+    client = StorageManagementClient(credential, subscription_id)
+    return client.storage_accounts.get_properties(resource_group, account_name)
+
+
+def _state_container(credential):
+    account = os.environ["STATE_STORAGE_ACCOUNT_NAME"]
+    container_name = os.environ["STATE_CONTAINER_NAME"]
+    blob_service = BlobServiceClient(
+        account_url=f"https://{account}.blob.core.windows.net", credential=credential
+    )
+    return blob_service.get_container_client(container_name)
+
+
+def _get_last_alert_time(container):
+    blob = container.get_blob_client(STATE_BLOB_NAME)
+    if not blob.exists():
+        return None
+    data = json.loads(blob.download_blob().readall())
+    return datetime.fromisoformat(data["last_alert_utc"])
+
+
+def _read_last_alert_time(container):
+    """_get_last_alert_time, but a storage failure returns None instead of raising.
+    The dedupe timestamp is best-effort: if we can't read it, worst case is one
+    duplicate email, which beats crashing a run that might need to alert."""
+    try:
+        return _get_last_alert_time(container)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning(f"Could not read dedupe state, treating as no prior alert: {exc}")
+        return None
+
+
+def _set_last_alert_time(container, when: datetime) -> None:
+    blob = container.get_blob_client(STATE_BLOB_NAME)
+    blob.upload_blob(json.dumps({"last_alert_utc": when.isoformat()}), overwrite=True)
+
+
+def _fmt(value) -> str:
+    """Render a property value for the drift trace: match Azure/portal wording for
+    bools, mark an absent value explicitly."""
+    if value is None:
+        return "(absent)"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 app = func.FunctionApp()
 
 
 @app.timer_trigger(schedule="0 0 7 * * *", arg_name="timer", run_on_startup=False)
 def drift_check(timer: func.TimerRequest) -> None:
-    """Placeholder - fleshed out in Task 5."""
+    subscription_id = os.environ["AZURE_SUBSCRIPTION_ID"]
+    target_rg = os.environ["TARGET_RESOURCE_GROUP"]
+    target_account = os.environ["TARGET_STORAGE_ACCOUNT_NAME"]
+    cooldown_days = int(os.environ.get("ALERT_COOLDOWN_DAYS", "3"))
+
+    credential = DefaultAzureCredential()
+
+    try:
+        account = _get_storage_account(
+            credential, subscription_id, target_rg, target_account
+        )
+    except ResourceNotFoundError:
+        # The reference RG or storage account is genuinely gone. Distinct setup
+        # error - not drift. evaluate_drift returns "target_missing" for actual=None.
+        account = None
+    except AzureError as exc:
+        logging.error(f"Azure API call failed, skipping this run: {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001 - nothing here may crash the app
+        logging.error(f"Unexpected error reading the target, skipping this run: {exc}")
+        return
+
+    expected = build_expected(_load_reference_template())
+    actual = build_actual(account) if account is not None else None
+
+    now = datetime.now(timezone.utc)
+    container = _state_container(credential)
+    last_alert = _read_last_alert_time(container)
+
+    decision = evaluate_drift(
+        expected,
+        actual,
+        watched_paths=WATCHED_PATHS,
+        last_alert_utc=last_alert,
+        now=now,
+        cooldown_days=cooldown_days,
+    )
+
+    if decision.outcome == "in_sync":
+        logging.info("Reference target in sync (0 drifted properties).")
+    elif decision.outcome == "target_missing":
+        # This "DriftDetectorSetupError:" prefix is what infra/resources.bicep's
+        # setup-error scheduledQueryRules alert matches on - keep them in sync.
+        logging.error(
+            f"DriftDetectorSetupError: storage account {target_account} not found "
+            f"in resource group {target_rg}"
+        )
+    elif decision.outcome == "suppressed":
+        n = len(decision.drifted)
+        logging.info(
+            f"Drift still present ({n} propert{'y' if n == 1 else 'ies'}) but "
+            f"suppressed - last alert was within the {cooldown_days}-day cooldown."
+        )
+    elif decision.outcome == "drift":
+        n = len(decision.drifted)
+        summary = "; ".join(
+            f"{d.path} expected {_fmt(d.expected)} got {_fmt(d.actual)}"
+            for d in decision.drifted
+        )
+        # This "DriftDetected:" prefix is what infra/resources.bicep's drift
+        # scheduledQueryRules alert matches on - keep them in sync.
+        logging.warning(
+            f"DriftDetected: {n} propert{'y' if n == 1 else 'ies'} drifted - {summary}"
+        )
+        _set_last_alert_time(container, now)
