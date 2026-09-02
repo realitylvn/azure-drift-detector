@@ -221,6 +221,37 @@ than rebuilding it.
 - Verified the freshness-comparison logic locally before committing (recompiled to a
   temp file, normalised both, confirmed `MATCH`).
 
+### Pre-provision hygiene pass (before Task 9 `azd provision`)
+
+Two corrections made before any detector infrastructure was provisioned — caught
+by a refreshed `cloud-preflight-review`, fixed as a history rewrite rather than a
+forward-only patch because the repo has no remote and had never been pushed.
+
+- **Identifier hygiene.** Early commits of the design spec, the implementation
+  plan, and this file's command log contained the real subscription ID, tenant
+  ID, and owner email (pasted from `az account show`). Those are identifying
+  information, not rotatable secrets, but they don't belong in version control —
+  a security team would treat a public push of them as an incident. Fixed:
+  every committed file now uses placeholder tokens (`<SUBSCRIPTION_ID>`,
+  `<TENANT_ID>`, `user@contoso.com`); `azure-naming-conventions.md` carries the
+  canonical placeholder list; `git filter-repo --replace-text` purged the real
+  values from all history; a `git grep` GUID/`/subscriptions/`/`onmicrosoft.com`
+  scan is now part of the pre-commit and pre-provision checklist. The Bicep was
+  already clean — it uses `subscription().subscriptionId` and `azd` env vars, no
+  hardcoded IDs; the one literal GUID (`acdd72a7-…`, built-in Reader role) is a
+  public well-known identifier.
+- **Repo scope.** `docs/superpowers/` (the brainstorming spec and implementation
+  plan — the internal working method) was being tracked. It's not portfolio
+  showcase content. Added to `.gitignore`, `git rm --cached`, and purged from
+  history in the same `filter-repo` run. The spec and plan are still written and
+  kept on the workstation under that ignored path — auditable locally, just not
+  published. What the repo publishes: `README.md`, this file,
+  `docs/architecture.md`, `azure-naming-conventions.md`, `infra/`, `function/`,
+  `tests/`, the CI workflow, `LICENSE`.
+
+Post-rewrite: 17 tests still green, both Bicep templates still compile, history
+scan clean across all refs.
+
 ---
 
 ## CLI command log
@@ -240,6 +271,15 @@ than rebuilding it.
 | `az bicep build --file infra/resources.bicep --stdout` | Compiled the detector resources template (Function App, storage + `state` container, Log Analytics, App Insights, Y1 plan, Action Group, two scheduled-query alert rules). Clean, zero warnings. |
 | `az bicep build --file infra/main.bicep --stdout` | Compiled the whole subscription-scoped tree including the cross-RG `reference-rbac.bicep` module. Clean. |
 | `az bicep build --file reference/reference.bicep --outfile $TEMP\fresh.json` | Recompiled the reference template to a scratch file to prove the committed `function/reference_template.json` is byte-current (after normalising away `metadata._generator`) — the same check CI runs. `MATCH`. |
+| `az role definition list --name Reader --query "[0].name" -o tsv` *(rerun)* | Re-confirmed the built-in `Reader` GUID during the pre-provision hygiene pass. |
+| `git rm -r --cached docs/superpowers/` | Stopped tracking the internal spec + plan (kept on disk, now `.gitignore`d) — they aren't portfolio showcase content. |
+| `pip install git-filter-repo` + `git filter-repo --force --invert-paths --path docs/superpowers/ --replace-text <map>` | One history rewrite: removed `docs/superpowers/` from every commit and replaced the real subscription ID / tenant ID / owner email with placeholder tokens throughout history. Safe to rewrite freely — no remote, never pushed. |
+| `git grep -nIE '<guid-regex>\|/subscriptions/…\|*.onmicrosoft.com'` across `git rev-list --all` | Post-rewrite scan — clean across all refs. Now a standing pre-commit / pre-provision check. |
+| `az account show --query "{sub:name,id:id,tenant:tenantId,user:user.name}" -o table` | Re-confirmed subscription / tenant / account at the top of Task 9. Output not pasted here — identifiers only, redacted by policy. |
+| `az group create -n rg-drift-detector-reference-dev -l eastus2 --tags portfolio=… project=drift-detector environment=dev` | Created the reference resource group (the watched target's home), tagged per the portfolio convention. `provisioningState: Succeeded`. |
+| `az deployment group create -g rg-drift-detector-reference-dev --template-file reference/reference.bicep` | Deployed the "intended state" storage account by hand — before `azd up`, because the detector's `main.bicep` puts a `Reader` assignment in this group and needs it to exist. Output: the reference storage account name (`stddref` + 10-char token). |
+| `azd env new drift-detector-dev` + `azd env set AZURE_LOCATION / AZURE_SUBSCRIPTION_ID / ALERT_COOLDOWN_DAYS / NOTIFICATION_EMAIL` | Created and populated the azd environment. Subscription ID and email set from real values locally; they live only in the git-ignored `.azure/` tree. |
+| `azd provision --preview` + `az deployment sub what-if --template-file infra/main.bicep …` | Dry-runs. azd's preview shows only its "primary" resources (6); the full sub-scope `what-if` confirmed all 11 (adds the Action Group and both `scheduledQueryRules`). No `Microsoft.Web` / Y1 quota block in East US 2. The cross-RG role assignment doesn't appear in `what-if` — its `principalId` depends on the not-yet-created Function App identity. |
 
 *(Still no `azd` commands and no resource-creating `az` commands — checkpoints 1–2 are all local: code, Bicep, and `az bicep build`. `azd provision` / `azd deploy` and the reference-group deployment happen at Task 9, behind an explicit go-ahead gate.)*
 
@@ -279,3 +319,10 @@ Filled in as each area is actually exercised.
 - **SDK / dependency management** *(exercised at checkpoint 1)* — pinning every runtime
   dependency with `==`, and consciously choosing a stable SDK model version over the
   newest release, as a reproducible-build discipline.
+- **Data protection in version control** *(exercised pre-provision)* — real
+  tenant / subscription / principal IDs and owner email treated as information that
+  doesn't belong in a repo; placeholder tokens in every committed file, a
+  `git grep` scan in the commit checklist, `git filter-repo` to clear history.
+  AZ-900 "privacy, compliance, and data protection" / Microsoft Purview-adjacent
+  thinking applied to the artifacts *around* the cloud resources, not just the
+  resources.
