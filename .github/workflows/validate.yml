@@ -1,0 +1,64 @@
+name: validate
+
+# Validation only - no Azure credentials, no deploy. Provisioning and deployment
+# are done from the workstation with `azd provision` / `azd deploy`. This catches
+# the failure modes that bit this project family: a Bicep template that doesn't
+# compile, a function that doesn't import (which `azd deploy` reports as success
+# while indexing zero functions), and a stale compiled reference template.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bicep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build Bicep templates
+        run: |
+          az bicep install
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+          az bicep build --file reference/reference.bicep --stdout > /dev/null
+          echo "Bicep compiled clean."
+
+  reference-template-fresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Reference template artifact is up to date
+        run: |
+          az bicep install
+          az bicep build --file reference/reference.bicep --outfile /tmp/fresh.json
+          python - <<'EOF'
+          import json, sys
+
+          def norm(path):
+              t = json.load(open(path))
+              t.get("metadata", {}).pop("_generator", None)
+              return json.dumps(t, sort_keys=True, indent=2)
+
+          if norm("/tmp/fresh.json") != norm("function/reference_template.json"):
+              print("::error::function/reference_template.json is stale. Run: "
+                    "az bicep build --file reference/reference.bicep "
+                    "--outfile function/reference_template.json")
+              sys.exit(1)
+          print("reference_template.json matches reference.bicep.")
+          EOF
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"  # must match linuxFxVersion in infra/resources.bicep
+      - name: Install test + pinned runtime dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run unit tests
+        run: pytest -q
