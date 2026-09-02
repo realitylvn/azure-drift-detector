@@ -228,7 +228,7 @@ than rebuilding it.
 | Command | What it did / why |
 |---|---|
 | `git init` / `git config user.*` | Project-scoped repo inside `azure-drift-detector/`, isolated from any stray `.git` higher up the tree (same setup Cost Sentinel documented). |
-| `az account show` | Pre-flight identity check before drafting any Bicep — confirmed **LVN Subscription** (`<SUBSCRIPTION_ID>-…`), tenant `<TENANT_ID>-…`, signed in as `user@contoso.com`. |
+| `az account show` | Pre-flight identity check before drafting any Bicep — confirmed the target subscription (`<SUBSCRIPTION_ID>`), tenant (`<TENANT_ID>`), and signed-in account (`user@contoso.com`). |
 | `az functionapp list` / `az vm list-usage -l eastus2` | Confirmed Cost Sentinel's Function App is already running in East US 2, i.e. the `Microsoft.Web` / Y1 Consumption quota that blocked Project 1 is cleared there with headroom — so this project targets the same region. |
 | `git checkout -b build/drift-detector-v1` | Feature branch for the implementation work; merges back at the end via the finishing-a-development-branch flow. |
 | `py -m venv .venv` + `pip install -r requirements-dev.txt` | Local test environment. `requirements-dev.txt` pulls in `function/requirements.txt` so the unit tests import the same pinned runtime deps that deploy. |

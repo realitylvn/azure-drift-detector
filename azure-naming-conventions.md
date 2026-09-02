@@ -59,3 +59,28 @@ Purpose: the Ops Dashboard project can later query across all resource groups by
 ## Storage account naming caveat
 
 Storage account names are lowercase alphanumeric only, 3–24 characters, globally unique, no hyphens. The project slug gets concatenated without separators (`stcostsentineldev`) before azd's uniqueness token is appended — verify the combined length stays under 24 characters before the token, since long slugs (`nsg-scanner` → `stnsgscannerdev` is fine, but watch this on any future project with a longer name).
+
+## Documentation placeholders (use in every committed file — never the real value)
+
+```
+tenant ID          -> <TENANT_ID>          example GUID: aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb
+subscription ID    -> <SUBSCRIPTION_ID>    example GUID: 11111111-0000-2222-3333-444444444444
+principal/object ID (managed identity, SP, user) -> <PRINCIPAL_ID>
+app/client ID      -> <CLIENT_ID>
+resource ID path   -> /subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RG_NAME>/...
+tenant domain      -> contoso.onmicrosoft.com
+owner/user email   -> user@contoso.com
+billing account / enrollment ID -> <BILLING_ACCOUNT_ID>
+```
+
+Resource names built from the pattern above (`func-<slug>-dev`) carry no secret and
+may be shown as-is. Redact the azd uniqueness token only where it sits next to a
+subscription ID.
+
+## Repo scope
+
+The published portfolio repo contains the Azure deliverable and nothing else.
+`docs/superpowers/` (brainstorming specs, implementation plans) is internal working
+material — `.gitignore` it, keep it locally. What ships: `README.md`, `REVIEW.md`,
+`docs/architecture.md`, this file, `infra/`, the function/app source, `tests/`, CI
+workflows, `LICENSE`.

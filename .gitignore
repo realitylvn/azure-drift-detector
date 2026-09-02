@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+
+# Internal working material - specs and implementation plans are kept locally
+# and version-controlled elsewhere, but do not ship in the portfolio repo.
+docs/superpowers/
