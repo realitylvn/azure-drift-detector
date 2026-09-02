@@ -252,6 +252,74 @@ forward-only patch because the repo has no remote and had never been pushed.
 Post-rewrite: 17 tests still green, both Bicep templates still compile, history
 scan clean across all refs.
 
+### Checkpoint 4 — provisioned & deployed (Task 9)
+
+- **`azd provision` needed a permission grant, not a skill change.** Claude Code's
+  auto-mode classifier passes granular `az` calls through but blocked
+  `azd provision` (broad multi-resource orchestration + `--no-prompt` suppressing
+  azd's own confirmation). Fixed by adding `Bash(azd provision:*)` /
+  `Bash(azd deploy:*)` to `.claude/settings.local.json` — a per-machine, gitignored
+  file that doesn't ship in the portfolio repo. `.claude/` added to `.gitignore`.
+
+- **`azd provision`** — 5 core resources in ~80s, no quota block. azd's summary
+  only lists its "primary" resources; `az resource list` confirmed the full set of
+  8 in `rg-drift-detector-dev`: storage (+ `state` container), Log Analytics,
+  App Insights, Y1 plan, Function App, Action Group,
+  `alert-drift-drift-detector-dev` (sev 3), `alert-setup-drift-detector-dev`
+  (sev 2).
+
+- **Cross-RG role assignment landed correctly.** `az role assignment list` for the
+  Function's managed identity returns exactly one row: `Reader` scoped to
+  `.../resourcegroups/rg-drift-detector-reference-dev`. Nothing at subscription
+  scope, nothing on the detector's own resource group. The `guid()`-derived
+  assignment name means a re-provision is idempotent.
+
+- **`azd deploy` reported success in 32s — then verified for real.** The lesson
+  from Cost Sentinel: "deploy succeeded" ≠ "the worker indexed the function."
+  Hit the runtime admin API directly
+  (`GET /admin/functions` with the master key): returns `drift_check` with a
+  `timerTrigger` binding, `schedule: "0 0 7 * * *"`, `isDisabled: false`. The
+  Python worker imported `function_app.py` cleanly — no `ImportError`, no
+  zero-functions-indexed surprise. The `azure-mgmt-storage==21.2.1` pin and the
+  literal `reference_template.json` shipping in the package both held up on the
+  remote Oryx build.
+
+- **Baseline verified — and a real bug caught in the same trace.** The first
+  manual trigger produced `Reference target in sync (0 drifted properties)` /
+  `Executed 'Functions.drift_check' (Succeeded, Duration=240ms)` — the drift
+  comparison works end to end against live Azure. But every run also logged a
+  `403 AuthorizationPermissionMismatch` from `Windows-Azure-Blob`.
+
+  **Root cause:** `_state_container` built its `BlobServiceClient` from
+  `DefaultAzureCredential()` — the managed identity. That identity holds exactly
+  one role: `Reader` on the *reference* resource group. It has no data-plane role
+  (`Storage Blob Data *`) on the detector's *own* storage account, so every blob
+  call 403s. `_read_last_alert_time` swallows it (returns `None`, treated as "no
+  prior alert"), so `in_sync` still succeeded — but `_set_last_alert_time` on the
+  drift path was unguarded and would have **crashed the run right after emitting
+  the `DriftDetected` trace**, and the cooldown timestamp would never persist, so
+  every subsequent run would re-alert.
+
+  This is a latent bug inherited straight from the Cost Sentinel fork — its
+  `_state_container` does the same thing. It never surfaced there because that
+  project's spend never triggered an anomaly, so `_set_last_alert_time` never ran
+  and the swallowed read-path 403 went unnoticed.
+
+  **Fix (matches what the spec already said):** the dedupe blob uses an
+  account-key **connection string**, not the identity —
+  `BlobServiceClient.from_connection_string(STATE_STORAGE_CONNECTION_STRING)`,
+  wired in `resources.bicep` from the same account key as `AzureWebJobsStorage`.
+  Keeps the identity's RBAC at exactly one `Reader` assignment (a blob-data role
+  just to write one timestamp would widen it for nothing). Also guarded the
+  drift-path `_set_last_alert_time` so a persist failure logs and continues
+  instead of crashing after the alert has fired. Re-provisioned, redeployed,
+  re-verified.
+
+  *Lesson:* "deployed", "`azd deploy` succeeded", and even "the function ran and
+  logged success" are still not "the function is doing everything it's supposed
+  to." The platform was logging the exact failure the whole time — reading the
+  actual traces, not just the exit code, is what caught it.
+
 ---
 
 ## CLI command log
@@ -280,6 +348,14 @@ scan clean across all refs.
 | `az deployment group create -g rg-drift-detector-reference-dev --template-file reference/reference.bicep` | Deployed the "intended state" storage account by hand — before `azd up`, because the detector's `main.bicep` puts a `Reader` assignment in this group and needs it to exist. Output: the reference storage account name (`stddref` + 10-char token). |
 | `azd env new drift-detector-dev` + `azd env set AZURE_LOCATION / AZURE_SUBSCRIPTION_ID / ALERT_COOLDOWN_DAYS / NOTIFICATION_EMAIL` | Created and populated the azd environment. Subscription ID and email set from real values locally; they live only in the git-ignored `.azure/` tree. |
 | `azd provision --preview` + `az deployment sub what-if --template-file infra/main.bicep …` | Dry-runs. azd's preview shows only its "primary" resources (6); the full sub-scope `what-if` confirmed all 11 (adds the Action Group and both `scheduledQueryRules`). No `Microsoft.Web` / Y1 quota block in East US 2. The cross-RG role assignment doesn't appear in `what-if` — its `principalId` depends on the not-yet-created Function App identity. |
+| *(added `Bash(azd provision:*)` / `Bash(azd deploy:*)` to `.claude/settings.local.json`)* | Claude Code's auto-mode classifier blocked `azd provision` (broad orchestration). A gitignored per-machine permission grant, not committed to the repo. |
+| `azd provision --no-prompt` | Created the 8 detector resources + the cross-RG `Reader` assignment in ~80s. Idempotent. |
+| `azd deploy --no-prompt` | Packaged `function/` (Oryx remote build) and published. 32s. |
+| `az functionapp keys list … --query masterKey` + `GET /admin/functions` | The real "did it work" check `azd deploy` doesn't do. Returned `drift_check` + `timerTrigger` + `schedule 0 0 7 * * *` — worker indexed cleanly. |
+| `az resource list -g rg-drift-detector-dev -o table` | Confirmed all 8 resources (azd's own summary lists only 5). |
+| `az functionapp identity show … --query principalId` + `az role assignment list --assignee <id> --all` | Confirmed exactly one role: `Reader` on `rg-drift-detector-reference-dev`. Least privilege intact. |
+| `POST /admin/functions/drift_check` (`{}`, master key) | Manual trigger for the baseline `in_sync` check. 202 accepted. |
+| `az monitor log-analytics query -w <workspace-guid> --analytics-query "AppTraces \| ..."` | Pulls the function's own traces from the workspace (workspace-based App Insights — `AppTraces`, PascalCase columns; the `az monitor app-insights query` path returns nothing for this component shape). |
 
 *(Still no `azd` commands and no resource-creating `az` commands — checkpoints 1–2 are all local: code, Bicep, and `az bicep build`. `azd provision` / `azd deploy` and the reference-group deployment happen at Task 9, behind an explicit go-ahead gate.)*
 
