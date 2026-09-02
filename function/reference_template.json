@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.46.1.21595",
+      "templateHash": "3959261898329572132"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for the reference storage account."
+      }
+    }
+  },
+  "variables": {
+    "referenceStorageName": "[format('stddref{0}', substring(uniqueString(subscription().id, 'drift-detector-reference'), 0, 10))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('referenceStorageName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "portfolio": "azure-devops-portfolio",
+        "project": "drift-detector",
+        "environment": "dev"
+      },
+      "kind": "StorageV2",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "properties": {
+        "minimumTlsVersion": "TLS1_2",
+        "allowBlobPublicAccess": false,
+        "supportsHttpsTrafficOnly": true
+      }
+    }
+  ],
+  "outputs": {
+    "referenceStorageAccountName": {
+      "type": "string",
+      "value": "[variables('referenceStorageName')]"
+    }
+  }
+}
