@@ -144,11 +144,16 @@ def _get_storage_account(credential, subscription_id, resource_group, account_na
     return client.storage_accounts.get_properties(resource_group, account_name)
 
 
-def _state_container(credential):
-    account = os.environ["STATE_STORAGE_ACCOUNT_NAME"]
+def _state_container():
+    """Container client for the dedupe-state blob, over an account-key connection
+    string - NOT the managed identity. The identity holds only Reader on the
+    reference resource group; it has no data-plane role on this storage account,
+    and granting one just to write a single timestamp would widen it for no
+    reason. STATE_STORAGE_CONNECTION_STRING is wired in resources.bicep from the
+    same account key as AzureWebJobsStorage."""
     container_name = os.environ["STATE_CONTAINER_NAME"]
-    blob_service = BlobServiceClient(
-        account_url=f"https://{account}.blob.core.windows.net", credential=credential
+    blob_service = BlobServiceClient.from_connection_string(
+        os.environ["STATE_STORAGE_CONNECTION_STRING"]
     )
     return blob_service.get_container_client(container_name)
 
@@ -218,7 +223,7 @@ def drift_check(timer: func.TimerRequest) -> None:
     actual = build_actual(account) if account is not None else None
 
     now = datetime.now(timezone.utc)
-    container = _state_container(credential)
+    container = _state_container()
     last_alert = _read_last_alert_time(container)
 
     decision = evaluate_drift(
@@ -256,4 +261,10 @@ def drift_check(timer: func.TimerRequest) -> None:
         logging.warning(
             f"DriftDetected: {n} propert{'y' if n == 1 else 'ies'} drifted - {summary}"
         )
-        _set_last_alert_time(container, now)
+        # The alert has already been raised via the trace above. A failure to
+        # persist the cooldown timestamp must not fail the run - worst case is a
+        # duplicate email on the next run, which beats a crash after we've alerted.
+        try:
+            _set_last_alert_time(container, now)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning(f"Could not persist dedupe timestamp: {exc}")
