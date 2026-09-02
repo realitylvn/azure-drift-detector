@@ -194,6 +194,33 @@ than rebuilding it.
   `infra/main.bicep`, `infra/resources.bicep`, `infra/reference-rbac.bicep`.
   17 Python tests still green.
 
+### Checkpoint 3 — CI validation workflow (Task 8)
+
+- **CI validates, it does not deploy.** No cloud credentials in the workflow — same
+  stance as Cost Sentinel. `azd provision` / `azd deploy` stay a workstation
+  operation. A standing deploy-capable identity federated to a *public* repo isn't
+  worth it for a project one person deploys by hand; that trade-off is on record here
+  and revisitable if the deploy cadence ever changes.
+
+- **Three jobs, each guarding a real past failure:**
+  1. `bicep` — `az bicep build` on `infra/main.bicep` (pulls in both modules) and
+     `reference/reference.bicep`. Catches "the template doesn't compile" before anyone
+     looks at a `what-if`.
+  2. `reference-template-fresh` — recompiles `reference.bicep` and fails if the
+     committed `function/reference_template.json` differs (after dropping the
+     `metadata._generator` block, which carries the Bicep CLI version and a template
+     hash and would otherwise cause spurious diffs across Bicep versions). This closes
+     the "someone edits the `.bicep` but forgets to recompile the artifact the Function
+     actually ships" gap — the artifact *is* the runtime source of truth, so a stale
+     one is a real bug.
+  3. `tests` — Python 3.11 (matched to `linuxFxVersion`), install the pinned
+     `requirements-dev.txt`, `pytest -q`. Covers `evaluate_drift`, the normalisation
+     mapping, the literal-values assertion on the shipped template, and the
+     worker-indexes-exactly-`drift_check` check.
+
+- Verified the freshness-comparison logic locally before committing (recompiled to a
+  temp file, normalised both, confirmed `MATCH`).
+
 ---
 
 ## CLI command log
@@ -212,6 +239,7 @@ than rebuilding it.
 | `az role definition list --name Reader --query "[0].name" -o tsv` | Verified the built-in `Reader` role GUID (`acdd72a7-3385-48ef-bd42-f606fba81ae7`) before hardcoding it into `infra/reference-rbac.bicep`, rather than guessing. |
 | `az bicep build --file infra/resources.bicep --stdout` | Compiled the detector resources template (Function App, storage + `state` container, Log Analytics, App Insights, Y1 plan, Action Group, two scheduled-query alert rules). Clean, zero warnings. |
 | `az bicep build --file infra/main.bicep --stdout` | Compiled the whole subscription-scoped tree including the cross-RG `reference-rbac.bicep` module. Clean. |
+| `az bicep build --file reference/reference.bicep --outfile $TEMP\fresh.json` | Recompiled the reference template to a scratch file to prove the committed `function/reference_template.json` is byte-current (after normalising away `metadata._generator`) — the same check CI runs. `MATCH`. |
 
 *(Still no `azd` commands and no resource-creating `az` commands — checkpoints 1–2 are all local: code, Bicep, and `az bicep build`. `azd provision` / `azd deploy` and the reference-group deployment happen at Task 9, behind an explicit go-ahead gate.)*
 
