@@ -3,5 +3,8 @@
 # to exactly this). Bump these consciously, re-run the tests, then redeploy.
 azure-functions==1.25.0
 azure-identity==1.25.3
-azure-mgmt-storage==25.1.0
+# 21.2.1 deliberately, NOT the 25.x line: 25.x is a from-scratch typespec rewrite
+# with a nested `.properties` model. 21.2.1 keeps the stable flattened model
+# (account.minimum_tls_version, account.allow_blob_public_access, ...). See REVIEW.md.
+azure-mgmt-storage==21.2.1
 azure-storage-blob==12.30.1

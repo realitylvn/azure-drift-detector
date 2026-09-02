@@ -90,6 +90,42 @@ def evaluate_drift(
     return DriftDecision("drift", drifted)
 
 
+def build_expected(template_json) -> dict:
+    """Pull the watched properties of the storage account out of a compiled ARM
+    template. Handles both the symbolic-name object form and the legacy array
+    form of the `resources` node."""
+    resources = template_json["resources"]
+    items = resources.values() if isinstance(resources, dict) else resources
+    storage = next(
+        r for r in items if r.get("type") == "Microsoft.Storage/storageAccounts"
+    )
+    props = storage["properties"]
+    return {
+        "sku": {"name": storage["sku"]["name"]},
+        "tags": dict(storage.get("tags", {})),
+        "properties": {
+            "minimumTlsVersion": props["minimumTlsVersion"],
+            "allowBlobPublicAccess": props["allowBlobPublicAccess"],
+            "supportsHttpsTrafficOnly": props["supportsHttpsTrafficOnly"],
+        },
+    }
+
+
+def build_actual(account) -> dict:
+    """Shape an azure-mgmt-storage StorageAccount model into the same dict form
+    as build_expected. str() the SDK enums so log messages and comparisons see
+    plain strings."""
+    return {
+        "sku": {"name": str(account.sku.name)},
+        "tags": dict(account.tags or {}),
+        "properties": {
+            "minimumTlsVersion": str(account.minimum_tls_version),
+            "allowBlobPublicAccess": bool(account.allow_blob_public_access),
+            "supportsHttpsTrafficOnly": bool(account.enable_https_traffic_only),
+        },
+    }
+
+
 app = func.FunctionApp()
 
 
