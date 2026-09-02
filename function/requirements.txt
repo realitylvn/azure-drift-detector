@@ -1,0 +1,7 @@
+# Pinned deliberately. Unpinned, Oryx installs latest on every remote build and a
+# major SDK bump can silently break a deploy (Cost Sentinel lost two deploy cycles
+# to exactly this). Bump these consciously, re-run the tests, then redeploy.
+azure-functions==1.25.0
+azure-identity==1.25.3
+azure-mgmt-storage==25.1.0
+azure-storage-blob==12.30.1

@@ -1,6 +1,5 @@
-.venv/
+.azure
 __pycache__/
 *.pyc
 .pytest_cache/
-.azure/
-.python_packages/
+.venv/
