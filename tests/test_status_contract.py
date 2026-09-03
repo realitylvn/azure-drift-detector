@@ -160,3 +160,66 @@ def test_publish_status_uploads_status_json_as_json(monkeypatch):
     assert calls["overwrite"] is True
     assert calls["content_type"] == "application/json"
     assert '"status": "ok"' in calls["data"]
+
+
+def _wire_entrypoint(monkeypatch, published):
+    """Common monkeypatching for drift_check entrypoint tests."""
+    import function_app as fa
+
+    monkeypatch.setattr(fa, "DefaultAzureCredential", lambda: object())
+    monkeypatch.setattr(fa, "_state_container", lambda: object())
+    monkeypatch.setattr(fa, "_read_last_alert_time", lambda c: None)
+    monkeypatch.setattr(fa, "_set_last_alert_time", lambda c, w: None)
+    monkeypatch.setattr(fa, "_publish_status", lambda d: published.append(d))
+    monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", "00000000-0000-0000-0000-000000000000")
+    monkeypatch.setenv("TARGET_RESOURCE_GROUP", "rg-ref")
+    monkeypatch.setenv("TARGET_STORAGE_ACCOUNT_NAME", "stref")
+    return fa
+
+
+def test_drift_check_publishes_ok_on_a_clean_run(monkeypatch):
+    published = []
+    fa = _wire_entrypoint(monkeypatch, published)
+    monkeypatch.setattr(fa, "_get_storage_account", lambda *a, **k: object())
+    expected = fa.build_expected(fa._load_reference_template())
+    monkeypatch.setattr(fa, "build_actual", lambda account: expected)
+
+    fa.drift_check(None)
+
+    assert len(published) == 1
+    assert published[0]["status"] == "ok"
+
+
+def test_drift_check_publishes_error_when_the_api_call_fails(monkeypatch):
+    from azure.core.exceptions import HttpResponseError
+
+    published = []
+    fa = _wire_entrypoint(monkeypatch, published)
+
+    def boom(*a, **k):
+        raise HttpResponseError("throttled")
+
+    monkeypatch.setattr(fa, "_get_storage_account", boom)
+
+    fa.drift_check(None)
+
+    assert len(published) == 1
+    assert published[0]["status"] == "error"
+
+
+def test_drift_check_publishes_error_on_target_missing(monkeypatch):
+    from azure.core.exceptions import ResourceNotFoundError
+
+    published = []
+    fa = _wire_entrypoint(monkeypatch, published)
+
+    def missing(*a, **k):
+        raise ResourceNotFoundError("gone")
+
+    monkeypatch.setattr(fa, "_get_storage_account", missing)
+
+    fa.drift_check(None)
+
+    assert len(published) == 1
+    assert published[0]["status"] == "error"
+    assert published[0]["detail"]["target_missing"] is True

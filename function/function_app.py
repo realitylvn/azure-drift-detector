@@ -312,6 +312,7 @@ def drift_check(timer: func.TimerRequest) -> None:
     cooldown_days = int(os.environ.get("ALERT_COOLDOWN_DAYS", "3"))
 
     credential = DefaultAzureCredential()
+    now = datetime.now(timezone.utc)
 
     try:
         account = _get_storage_account(
@@ -323,15 +324,18 @@ def drift_check(timer: func.TimerRequest) -> None:
         account = None
     except AzureError as exc:
         logging.error(f"Azure API call failed, skipping this run: {exc}")
+        _publish_status(build_status_dict(None, now, error_reason="Azure API call failed"))
         return
     except Exception as exc:  # noqa: BLE001 - nothing here may crash the app
         logging.error(f"Unexpected error reading the target, skipping this run: {exc}")
+        _publish_status(
+            build_status_dict(None, now, error_reason="Unexpected error reading the target")
+        )
         return
 
     expected = build_expected(_load_reference_template())
     actual = build_actual(account) if account is not None else None
 
-    now = datetime.now(timezone.utc)
     container = _state_container()
     last_alert = _read_last_alert_time(container)
 
@@ -370,6 +374,14 @@ def drift_check(timer: func.TimerRequest) -> None:
         logging.warning(
             f"DriftDetected: {n} propert{'y' if n == 1 else 'ies'} drifted - {summary}"
         )
+
+    # Publish the run's outcome for the Ops Command Center dashboard. Best-effort:
+    # a publish failure never fails the run. Reached on every non-error path so
+    # generated_at always advances (the dashboard's staleness rule depends on it);
+    # the early-return branches above publish their own status: error first.
+    _publish_status(build_status_dict(decision, now))
+
+    if decision.outcome == "drift":
         # The alert has already been raised via the trace above. A failure to
         # persist the cooldown timestamp must not fail the run - worst case is a
         # duplicate email on the next run, which beats a crash after we've alerted.
