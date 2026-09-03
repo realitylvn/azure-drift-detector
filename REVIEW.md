@@ -340,11 +340,13 @@ The whole point of the repo, run for real:
 - **`autoMitigate: true`** on both alert rules means the fired alert
   self-resolves once the `DriftDetected` trace ages out of the 1-hour window — no
   manual clearing.
-- **Alert email:** the `scheduledQueryRules` rules evaluate hourly
-  (`evaluationFrequency: PT1H`), so the email trails the trace by up to ~an hour
-  (Cost Sentinel saw ~10 min in practice). The trace is the immediate proof; the
-  email is the same trace → Log Alert → Action Group → inbox chain Cost Sentinel
-  already validated.
+- **Alert fired and emailed.** `alert-drift-drift-detector-dev` (Sev 3)
+  transitioned to `Fired` ~7 minutes after the `DriftDetected` trace and sent the
+  Action Group email — the `evaluationFrequency: PT1H` is the *maximum* interval,
+  not a fixed delay (Cost Sentinel saw the same ~10-minute real-world latency).
+  Full path confirmed end to end: trace → Log Analytics → `scheduledQueryRules` →
+  Action Group → inbox. `autoMitigate: true` resolved it once the drift was
+  reverted and the trace aged out of the window.
 - **Quieted the Azure SDK HTTP logging.** The first live runs dumped every
   `azure-identity` / `azure-storage-blob` request and response at INFO into
   App Insights, burying the one-line `DriftDetected` / `in sync` trace that both
@@ -389,8 +391,19 @@ The whole point of the repo, run for real:
 | `az functionapp identity show … --query principalId` + `az role assignment list --assignee <id> --all` | Confirmed exactly one role: `Reader` on `rg-drift-detector-reference-dev`. Least privilege intact. |
 | `POST /admin/functions/drift_check` (`{}`, master key) | Manual trigger for the baseline `in_sync` check. 202 accepted. |
 | `az monitor log-analytics query -w <workspace-guid> --analytics-query "AppTraces \| ..."` | Pulls the function's own traces from the workspace (workspace-based App Insights — `AppTraces`, PascalCase columns; the `az monitor app-insights query` path returns nothing for this component shape). |
+| `az monitor log-analytics query … "union AppTraces, AppExceptions \| where Message has '403'"` | Caught the `403 AuthorizationPermissionMismatch` from `Windows-Azure-Blob` — the dedupe-blob-via-managed-identity bug (checkpoint 4). Count went to 0 after the connection-string fix. |
+| `az functionapp config appsettings list … --query "[?name=='STATE_STORAGE_CONNECTION_STRING']"` | Confirmed the new app setting landed on re-provision and the old `STATE_STORAGE_ACCOUNT_NAME` was gone. |
+| `azd provision` + `azd deploy` *(x2 more)* | Once for the dedupe-blob connection-string fix, once for the quieter Azure SDK logging. Each re-verified via `GET /admin/functions` + a manual trigger. |
+| `az storage account show -g rg-drift-detector-reference-dev -n stddref… --query "allowBlobPublicAccess"` | Confirmed the manual portal change (`true`) before triggering the detector, and the revert (`false`) after the reference-template redeploy. |
+| `POST /admin/functions/drift_check` *(several)* | Manual triggers for each demo step: baseline, post-drift, cooldown-suppression, post-revert. |
+| `az storage blob show --account-name stdriftdetectordev… --container-name state --name last-alert.json` | Confirmed the dedupe timestamp blob was written (`Last-Modified` matched the drift run) — proof the connection-string path works where the identity path 403'd. |
+| `az deployment group create -g rg-drift-detector-reference-dev --template-file reference/reference.bicep` *(rerun)* | The "legitimate redeploy" — idempotent, set `allowBlobPublicAccess` back to `false`. Next detector run returned `in_sync`: no false positive. |
+| `az rest --method get --url ".../Microsoft.AlertsManagement/alerts?api-version=2019-05-05-preview"` | Confirmed `alert-drift-drift-detector-dev` (Sev 3) transitioned to `Fired` ~7 min after the trace, and `autoMitigate` resolved it after the revert. |
+| `npx @mermaid-js/mermaid-cli -i architecture.mmd -o …` (parse + both themes) | Verified the `docs/architecture.md` / README diagram renders on GitHub in both light and dark page themes before committing (per `verifying-mermaid-diagrams`). |
 
-*(Still no `azd` commands and no resource-creating `az` commands — checkpoints 1–2 are all local: code, Bicep, and `az bicep build`. `azd provision` / `azd deploy` and the reference-group deployment happen at Task 9, behind an explicit go-ahead gate.)*
+*(Checkpoints 1–3 were all local — code, Bicep, `az bicep build`. `azd provision` /
+`azd deploy` and the reference-group deployment start at checkpoint 4, each behind
+an explicit go-ahead.)*
 
 ---
 
@@ -398,10 +411,12 @@ The whole point of the repo, run for real:
 
 Filled in as each area is actually exercised.
 
-- **Governance / IaC as source of truth** *(designed, partially built)* — the entire
+- **Governance / IaC as source of truth** *(built and demonstrated)* — the entire
   project is a working argument for why configuration drift from IaC matters and how
   you detect it. `infra/` is Bicep through `azd`; the reference template is compiled
-  and version-controlled; CI gates every change on `az bicep build`.
+  and version-controlled; CI gates every change on `az bicep build`. Demonstrated
+  live: a portal toggle → `DriftDetected` within minutes → a redeploy clears it
+  with no false positive.
 - **Least-privilege RBAC** *(built at Task 7)* — a single built-in `Reader`
   assignment, cross-resource-group, scoped to exactly the watched resource group. Good
   concrete contrast with Cost Sentinel's Cost Management Reader and a demonstration of
@@ -419,9 +434,13 @@ Filled in as each area is actually exercised.
   table-name distinction), Action Groups with the 12-char short-name limit,
   Application Insights with sampling disabled and Log Analytics ingestion capped at
   1 GB/day. Two alert rules at severity 3 (drift) and severity 2 (detector broken).
-- **Security posture** *(designed)* — `allowBlobPublicAccess` is the featured drift
-  example: storage-account exposure settings, the same "unauthorised exposure" theme
-  the NSG Scanner project picks up one layer down.
+- **Security posture** *(demonstrated)* — `allowBlobPublicAccess` (portal label:
+  "Allow Blob anonymous access") is the featured drift example: storage-account
+  exposure settings, the same "unauthorised exposure" theme the NSG Scanner
+  project picks up one layer down. Also a live lesson in least privilege biting
+  back: the dedupe blob 403'd because the identity is scoped so tightly it can't
+  touch the detector's own storage — resolved with a connection string rather
+  than by widening the role.
 - **Service limits & quotas** *(confirmed)* — re-verified the `Microsoft.Web` / Y1
   Consumption quota family is distinct from `Microsoft.Compute` VM quota and already
   cleared in East US 2 from Project 1.
