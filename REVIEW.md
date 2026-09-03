@@ -401,8 +401,14 @@ contract: `azure-ops-command-center/docs/status-contract.md`. This project only
   `status.json` URL for valid `schema_version: 1` JSON, then record the real
   URL below. This is the gate for starting project 5.
 
-**Live `$web` endpoint:** _to be filled after the post-merge deploy —
-`https://<storage-account>.z<NN>.web.core.windows.net/status.json`._
+**Live `$web` endpoint:**
+`https://stdriftdetectordevrriqoy.z20.web.core.windows.net/status.json`
+— verified 2026-09-03 after `azd provision` + `azd deploy` from `main`:
+`HTTP 200`, `content-type: application/json`, `schema_version: 1`,
+`status: "ok"` ("In sync - 0 drifted properties") from a manual
+`POST /admin/functions/drift_check`. The postprovision hook enabled
+static-website hosting (`status.json` as index + 404 doc) and the wildcard
+`GET` CORS rule landed on the blob service.
 
 ---
 
