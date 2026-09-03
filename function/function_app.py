@@ -8,7 +8,7 @@ import azure.functions as func
 from azure.core.exceptions import AzureError, ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.storage import StorageManagementClient
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, ContentSettings
 
 # The azure-identity / azure-*-storage SDKs log every HTTP request and response at
 # INFO, which buries this function's own one-line decision trace (the thing the
@@ -164,6 +164,39 @@ def _state_container():
     return blob_service.get_container_client(container_name)
 
 
+STATUS_BLOB_NAME = "status.json"
+WEB_CONTAINER_NAME = "$web"
+
+
+def _web_container():
+    """Container client for the public $web blob, over the same account-key
+    connection string the dedupe-state blob uses - NOT the managed identity,
+    which has no data-plane role here. Static-website hosting is turned on out
+    of band by scripts/enable-static-website.ps1 (an azd postprovision hook),
+    so $web serves status.json anonymously without allowBlobPublicAccess."""
+    blob_service = BlobServiceClient.from_connection_string(
+        os.environ["STATE_STORAGE_CONNECTION_STRING"]
+    )
+    return blob_service.get_container_client(WEB_CONTAINER_NAME)
+
+
+def _publish_status(status_dict) -> None:
+    """Best-effort publish of status.json to $web. A failure here must never
+    fail the run - same guard as _set_last_alert_time. The dashboard treats a
+    missing or stale file as 'unreachable', which is the honest outcome."""
+    try:
+        _web_container().upload_blob(
+            STATUS_BLOB_NAME,
+            json.dumps(status_dict, indent=2),
+            overwrite=True,
+            content_settings=ContentSettings(
+                content_type="application/json", cache_control="max-age=300"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.warning(f"Could not publish status.json: {exc}")
+
+
 def _get_last_alert_time(container):
     blob = container.get_blob_client(STATE_BLOB_NAME)
     if not blob.exists():
@@ -198,6 +231,76 @@ def _fmt(value) -> str:
     return str(value)
 
 
+SCHEMA_VERSION = 1
+PROJECT_SLUG = "azure-drift-detector"
+REPO_URL = "https://github.com/realitylvn/azure-drift-detector"
+
+
+def _status_value(v):
+    """Render a drifted-property value for status.json: a bool as the lowercase
+    string Azure/the portal uses, an absent value (None) as JSON null, anything
+    else stringified."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
+def _drift_status(decision):
+    """(status, headline, detail) for a completed DriftDecision."""
+    drifted = [
+        {
+            "property": d.path,
+            "expected": _status_value(d.expected),
+            "actual": _status_value(d.actual),
+        }
+        for d in decision.drifted
+    ]
+    n = len(drifted)
+    unit = "property" if n == 1 else "properties"
+    detail = {
+        "drifted_count": n,
+        "drifted": drifted,
+        "suppressed_by_cooldown": decision.outcome == "suppressed",
+        "target_missing": decision.outcome == "target_missing",
+    }
+    if decision.outcome == "in_sync":
+        return "ok", "In sync - 0 drifted properties", detail
+    if decision.outcome == "target_missing":
+        return "error", "Reference target not found", detail
+    if decision.outcome == "suppressed":
+        return "finding", f"{n} {unit} drifted - alert in cooldown", detail
+    return "finding", f"{n} {unit} drifted", detail
+
+
+def build_status_dict(decision, now, *, error_reason=None):
+    """Pure: a DriftDecision (or an error_reason string) plus a clock value in,
+    the status.json contract dict out. No I/O, no clock, no globals - all of
+    that stays in the entrypoint, same split as evaluate_drift."""
+    if error_reason is not None:
+        status, headline, detail = "error", error_reason, {
+            "drifted_count": 0,
+            "drifted": [],
+            "suppressed_by_cooldown": False,
+            "target_missing": False,
+        }
+    else:
+        status, headline, detail = _drift_status(decision)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "project": PROJECT_SLUG,
+        "cadence": "scheduled-daily",
+        "generated_at": ts,
+        "last_run_at": ts,
+        "status": status,
+        "headline": headline,
+        "detail": detail,
+        "repo_url": REPO_URL,
+    }
+
+
 app = func.FunctionApp()
 
 
@@ -209,6 +312,7 @@ def drift_check(timer: func.TimerRequest) -> None:
     cooldown_days = int(os.environ.get("ALERT_COOLDOWN_DAYS", "3"))
 
     credential = DefaultAzureCredential()
+    now = datetime.now(timezone.utc)
 
     try:
         account = _get_storage_account(
@@ -220,15 +324,18 @@ def drift_check(timer: func.TimerRequest) -> None:
         account = None
     except AzureError as exc:
         logging.error(f"Azure API call failed, skipping this run: {exc}")
+        _publish_status(build_status_dict(None, now, error_reason="Azure API call failed"))
         return
     except Exception as exc:  # noqa: BLE001 - nothing here may crash the app
         logging.error(f"Unexpected error reading the target, skipping this run: {exc}")
+        _publish_status(
+            build_status_dict(None, now, error_reason="Unexpected error reading the target")
+        )
         return
 
     expected = build_expected(_load_reference_template())
     actual = build_actual(account) if account is not None else None
 
-    now = datetime.now(timezone.utc)
     container = _state_container()
     last_alert = _read_last_alert_time(container)
 
@@ -267,6 +374,14 @@ def drift_check(timer: func.TimerRequest) -> None:
         logging.warning(
             f"DriftDetected: {n} propert{'y' if n == 1 else 'ies'} drifted - {summary}"
         )
+
+    # Publish the run's outcome for the Ops Command Center dashboard. Best-effort:
+    # a publish failure never fails the run. Reached on every non-error path so
+    # generated_at always advances (the dashboard's staleness rule depends on it);
+    # the early-return branches above publish their own status: error first.
+    _publish_status(build_status_dict(decision, now))
+
+    if decision.outcome == "drift":
         # The alert has already been raised via the trace above. A failure to
         # persist the cooldown timestamp must not fail the run - worst case is a
         # duplicate email on the next run, which beats a crash after we've alerted.
