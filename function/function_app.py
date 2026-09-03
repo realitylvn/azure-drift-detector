@@ -8,7 +8,7 @@ import azure.functions as func
 from azure.core.exceptions import AzureError, ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.storage import StorageManagementClient
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, ContentSettings
 
 # The azure-identity / azure-*-storage SDKs log every HTTP request and response at
 # INFO, which buries this function's own one-line decision trace (the thing the
@@ -162,6 +162,39 @@ def _state_container():
         os.environ["STATE_STORAGE_CONNECTION_STRING"]
     )
     return blob_service.get_container_client(container_name)
+
+
+STATUS_BLOB_NAME = "status.json"
+WEB_CONTAINER_NAME = "$web"
+
+
+def _web_container():
+    """Container client for the public $web blob, over the same account-key
+    connection string the dedupe-state blob uses - NOT the managed identity,
+    which has no data-plane role here. Static-website hosting is turned on out
+    of band by scripts/enable-static-website.ps1 (an azd postprovision hook),
+    so $web serves status.json anonymously without allowBlobPublicAccess."""
+    blob_service = BlobServiceClient.from_connection_string(
+        os.environ["STATE_STORAGE_CONNECTION_STRING"]
+    )
+    return blob_service.get_container_client(WEB_CONTAINER_NAME)
+
+
+def _publish_status(status_dict) -> None:
+    """Best-effort publish of status.json to $web. A failure here must never
+    fail the run - same guard as _set_last_alert_time. The dashboard treats a
+    missing or stale file as 'unreachable', which is the honest outcome."""
+    try:
+        _web_container().upload_blob(
+            STATUS_BLOB_NAME,
+            json.dumps(status_dict, indent=2),
+            overwrite=True,
+            content_settings=ContentSettings(
+                content_type="application/json", cache_control="max-age=300"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.warning(f"Could not publish status.json: {exc}")
 
 
 def _get_last_alert_time(container):

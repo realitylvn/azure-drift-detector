@@ -98,3 +98,65 @@ def test_result_is_json_serializable():
         "drift", (DriftedProperty("tags.project", "drift-detector", None),)
     )
     json.dumps(build_status_dict(decision, NOW))
+
+
+def test_web_container_uses_the_connection_string_and_the_web_container(monkeypatch):
+    import function_app
+
+    captured = {}
+
+    class FakeBlobService:
+        @classmethod
+        def from_connection_string(cls, conn_str):
+            captured["conn_str"] = conn_str
+            return cls()
+
+        def get_container_client(self, name):
+            captured["container"] = name
+            return "container-client"
+
+    monkeypatch.setattr(function_app, "BlobServiceClient", FakeBlobService)
+    monkeypatch.setenv(
+        "STATE_STORAGE_CONNECTION_STRING",
+        "DefaultEndpointsProtocol=https;AccountName=x;AccountKey=k;EndpointSuffix=core.windows.net",
+    )
+
+    result = function_app._web_container()
+
+    assert result == "container-client"
+    assert "AccountKey=" in captured["conn_str"]
+    assert captured["container"] == "$web"
+
+
+def test_publish_status_swallows_a_storage_failure(monkeypatch):
+    import function_app
+
+    def boom():
+        raise RuntimeError("storage unreachable")
+
+    monkeypatch.setattr(function_app, "_web_container", boom)
+
+    # Must not raise - a publish failure can never fail the run.
+    function_app._publish_status({"schema_version": 1})
+
+
+def test_publish_status_uploads_status_json_as_json(monkeypatch):
+    import function_app
+
+    calls = {}
+
+    class FakeContainer:
+        def upload_blob(self, name, data, overwrite, content_settings):
+            calls["name"] = name
+            calls["data"] = data
+            calls["overwrite"] = overwrite
+            calls["content_type"] = content_settings.content_type
+
+    monkeypatch.setattr(function_app, "_web_container", lambda: FakeContainer())
+
+    function_app._publish_status({"schema_version": 1, "status": "ok"})
+
+    assert calls["name"] == "status.json"
+    assert calls["overwrite"] is True
+    assert calls["content_type"] == "application/json"
+    assert '"status": "ok"' in calls["data"]
