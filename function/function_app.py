@@ -198,6 +198,76 @@ def _fmt(value) -> str:
     return str(value)
 
 
+SCHEMA_VERSION = 1
+PROJECT_SLUG = "azure-drift-detector"
+REPO_URL = "https://github.com/realitylvn/azure-drift-detector"
+
+
+def _status_value(v):
+    """Render a drifted-property value for status.json: a bool as the lowercase
+    string Azure/the portal uses, an absent value (None) as JSON null, anything
+    else stringified."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
+def _drift_status(decision):
+    """(status, headline, detail) for a completed DriftDecision."""
+    drifted = [
+        {
+            "property": d.path,
+            "expected": _status_value(d.expected),
+            "actual": _status_value(d.actual),
+        }
+        for d in decision.drifted
+    ]
+    n = len(drifted)
+    unit = "property" if n == 1 else "properties"
+    detail = {
+        "drifted_count": n,
+        "drifted": drifted,
+        "suppressed_by_cooldown": decision.outcome == "suppressed",
+        "target_missing": decision.outcome == "target_missing",
+    }
+    if decision.outcome == "in_sync":
+        return "ok", "In sync - 0 drifted properties", detail
+    if decision.outcome == "target_missing":
+        return "error", "Reference target not found", detail
+    if decision.outcome == "suppressed":
+        return "finding", f"{n} {unit} drifted - alert in cooldown", detail
+    return "finding", f"{n} {unit} drifted", detail
+
+
+def build_status_dict(decision, now, *, error_reason=None):
+    """Pure: a DriftDecision (or an error_reason string) plus a clock value in,
+    the status.json contract dict out. No I/O, no clock, no globals - all of
+    that stays in the entrypoint, same split as evaluate_drift."""
+    if error_reason is not None:
+        status, headline, detail = "error", error_reason, {
+            "drifted_count": 0,
+            "drifted": [],
+            "suppressed_by_cooldown": False,
+            "target_missing": False,
+        }
+    else:
+        status, headline, detail = _drift_status(decision)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "project": PROJECT_SLUG,
+        "cadence": "scheduled-daily",
+        "generated_at": ts,
+        "last_run_at": ts,
+        "status": status,
+        "headline": headline,
+        "detail": detail,
+        "repo_url": REPO_URL,
+    }
+
+
 app = func.FunctionApp()
 
 
