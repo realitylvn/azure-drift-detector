@@ -320,6 +320,39 @@ scan clean across all refs.
   to." The platform was logging the exact failure the whole time — reading the
   actual traces, not just the exit code, is what caught it.
 
+### Checkpoint 5 — the before/after demo, verified end to end (Task 10)
+
+The whole point of the repo, run for real:
+
+| Step | Action | Result (from `AppTraces`) |
+|---|---|---|
+| 1 | baseline | `Reference target in sync (0 drifted properties).` → `Succeeded` |
+| 2 | **manual portal change**: reference storage account → *Allow Blob anonymous access* → **Enabled** → Save | *(the portal relabelled `allowBlobPublicAccess` to "anonymous access"; ARM property name unchanged)* |
+| 3 | trigger detector | `DriftDetected: 1 property drifted - properties.allowBlobPublicAccess expected false got true` → `last-alert.json` written 00:06:06Z → `Succeeded` |
+| 4 | trigger again (still drifted) | `Drift still present (1 property) but suppressed - last alert was within the 3-day cooldown.` → `Succeeded` |
+| 5 | `az deployment group create` on `reference/reference.bicep` again (idempotent redeploy) | live `allowBlobPublicAccess` back to `false` |
+| 6 | trigger detector | `Reference target in sync (0 drifted properties).` — **a legitimate redeploy produces zero drift, no false positive** |
+
+- **The suppression path (step 4) had never actually run before.** Cost Sentinel's
+  cooldown logic was unit-tested but never exercised live, because its spend never
+  triggered an anomaly. Here the full read-blob → compare-timestamp → suppress
+  cycle is confirmed against real storage.
+- **`autoMitigate: true`** on both alert rules means the fired alert
+  self-resolves once the `DriftDetected` trace ages out of the 1-hour window — no
+  manual clearing.
+- **Alert email:** the `scheduledQueryRules` rules evaluate hourly
+  (`evaluationFrequency: PT1H`), so the email trails the trace by up to ~an hour
+  (Cost Sentinel saw ~10 min in practice). The trace is the immediate proof; the
+  email is the same trace → Log Alert → Action Group → inbox chain Cost Sentinel
+  already validated.
+- **Quieted the Azure SDK HTTP logging.** The first live runs dumped every
+  `azure-identity` / `azure-storage-blob` request and response at INFO into
+  App Insights, burying the one-line `DriftDetected` / `in sync` trace that both
+  the Log Alert and a human actually read. Added
+  `logging.getLogger("azure").setLevel(logging.WARNING)` at module load — real
+  SDK failures still surface, the routine request dumps don't, and App Insights
+  ingestion drops accordingly.
+
 ---
 
 ## CLI command log

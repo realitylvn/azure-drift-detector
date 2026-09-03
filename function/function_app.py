@@ -10,6 +10,12 @@ from azure.identity import DefaultAzureCredential
 from azure.mgmt.storage import StorageManagementClient
 from azure.storage.blob import BlobServiceClient
 
+# The azure-identity / azure-*-storage SDKs log every HTTP request and response at
+# INFO, which buries this function's own one-line decision trace (the thing the
+# Log Alert matches on, and the thing a human reads in App Insights). Quiet them
+# to WARNING - real failures still surface, the routine request dumps don't.
+logging.getLogger("azure").setLevel(logging.WARNING)
+
 WATCHED_PATHS = [
     "sku.name",
     "tags.portfolio",
