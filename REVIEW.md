@@ -357,6 +357,55 @@ The whole point of the repo, run for real:
 
 ---
 
+### Checkpoint 6 — status-contract rollout (2026-09-03)
+
+Part of the portfolio-wide status-contract rollout — a coordinated, after-the-fact
+change across the four producer repos so the Ops Command Center dashboard (project
+5) has something to aggregate. Spec:
+`azure-ops-command-center/docs/superpowers/specs/2026-09-03-status-contract-rollout-design.md`;
+contract: `azure-ops-command-center/docs/status-contract.md`. This project only
+*produces* its `status.json` — it does not consume anyone else's.
+
+- **`build_status_dict` — a pure function**, same discipline as `evaluate_drift`:
+  a `DriftDecision` (or an error-reason string) plus a clock value in, the fixed
+  cross-project contract dict out, no I/O. One `tests/test_status_contract.py`
+  case per outcome — `in_sync` → `ok`, `drift` / `suppressed` → `finding`,
+  `target_missing` and the API-error paths → `error`. Booleans render as the
+  lowercase strings the portal uses; an absent property side serialises as JSON
+  `null`.
+- **`_publish_status` writes to the storage account's `$web` container** over the
+  **account-key connection string** — the same channel the dedupe-state blob
+  uses, not the managed identity (which still holds exactly one `Reader`
+  assignment on the reference resource group and has no data-plane role here —
+  the checkpoint-4 lesson). Best-effort: a publish failure logs a warning and the
+  run continues, exactly like the guarded `_set_last_alert_time`.
+- **`drift_check` refactored so every exit path publishes.** The two early-return
+  error branches (`AzureError`, unexpected exception) now emit `status: "error"`
+  before returning, so `generated_at` advances on every run and the dashboard's
+  staleness rule can trust it. A genuinely broken detector shows as `error`,
+  never as stale-but-plausible data.
+- **Wildcard `GET` CORS on the blob service** (`infra/resources.bicep`). The only
+  cross-origin consumer is the dashboard fetching one non-sensitive JSON file
+  that is already served anonymously; a wildcard origin adds no exposure and
+  avoids a second edit once the dashboard hostname exists.
+- **`$web` static-website hosting enabled by an `azd` postprovision hook**
+  (`scripts/enable-static-website.ps1`), not Bicep — it is a data-plane
+  blob-service setting with no ARM representation. `$web` serves `status.json`
+  anonymously **without** `allowBlobPublicAccess` on the account, which is the
+  exact exposure this detector exists to catch.
+- **Local verification:** `pytest -q` → 32 passing (was 19), including
+  `test_function_indexes` (still one `drift_check` / `timerTrigger` — the publish
+  is inline, no new trigger). `az bicep build --file infra/main.bicep` clean.
+- **Post-merge (Jonathan, from the workstation):** `azd provision` (applies the
+  CORS change, runs the static-website hook) → `azd deploy` → `curl` the `$web`
+  `status.json` URL for valid `schema_version: 1` JSON, then record the real
+  URL below. This is the gate for starting project 5.
+
+**Live `$web` endpoint:** _to be filled after the post-merge deploy —
+`https://<storage-account>.z<NN>.web.core.windows.net/status.json`._
+
+---
+
 ## CLI command log
 
 | Command | What it did / why |
@@ -404,6 +453,16 @@ The whole point of the repo, run for real:
 *(Checkpoints 1–3 were all local — code, Bicep, `az bicep build`. `azd provision` /
 `azd deploy` and the reference-group deployment start at checkpoint 4, each behind
 an explicit go-ahead.)*
+
+**Checkpoint 6 — status-contract rollout:**
+
+| Command | What it did / why |
+|---|---|
+| `.venv\Scripts\python -m pytest -q` | 32 green (was 19) — the new `test_status_contract.py` covers `build_status_dict` per outcome, `_web_container` / `_publish_status`, and the three `drift_check` publish-on-every-path cases. |
+| `az bicep build --file infra/main.bicep --stdout` | Confirmed the wildcard-GET `cors` block on `blobServices` compiles clean. |
+| `azd provision` *(Jonathan, post-merge)* | Applies the CORS change and runs `scripts/enable-static-website.ps1` (postprovision hook) to turn on `$web` hosting. |
+| `azd deploy` *(Jonathan, post-merge)* | Ships the `function_app.py` change. Verify with `GET /admin/functions` — still just `drift_check`. |
+| `curl -s https://<account>.z<NN>.web.core.windows.net/status.json` *(Jonathan, post-deploy)* | Rollout gate — valid `schema_version: 1` JSON matching the contract. Paste the real URL into checkpoint 6. |
 
 ---
 
@@ -454,3 +513,11 @@ Filled in as each area is actually exercised.
   AZ-900 "privacy, compliance, and data protection" / Microsoft Purview-adjacent
   thinking applied to the artifacts *around* the cloud resources, not just the
   resources.
+- **Monitoring & observability / cross-service data contract** *(built at checkpoint
+  6)* — the detector publishes a machine-readable health snapshot (`status.json`)
+  to a fixed schema shared across four projects, versioned with `schema_version`
+  for forward compatibility; the consumer derives staleness rather than the
+  producer asserting freshness. Static-website (`$web`) anonymous hosting *without*
+  `allowBlobPublicAccess`, plus blob-service CORS, is concrete AZ-104 storage:
+  the data-plane vs control-plane line is why `$web` is an `azd` hook and CORS is
+  Bicep — one `azd up`, two mechanisms.
